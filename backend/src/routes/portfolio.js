@@ -35,6 +35,9 @@ const assertValidPortfolioSlug = (slug) => {
   }
 };
 
+// In-memory fallback for testing without a database
+const inMemoryStore = new Map();
+
 // Helper to reconstruct full state from versions
 const reconstructVersion = async (portfolioId, targetVersionNumber, isConnected) => {
   if (isConnected) {
@@ -158,6 +161,21 @@ router.post('/:id/save', verifyToken, asyncHandler(async (req, res) => {
     // Prune old versions (keep latest 50)
     if (newVersionNumber > 50) {
       const thresholdVersion = newVersionNumber - 50;
+      
+      // Ensure the new base version (thresholdVersion + 1) is a snapshot so it doesn't get orphaned
+      const nextBaseVersion = await PortfolioVersion.findOne({
+          portfolioId: id,
+          version: thresholdVersion + 1
+      });
+
+      if (nextBaseVersion && !nextBaseVersion.snapshot) {
+          const fullContent = await reconstructVersion(id, thresholdVersion + 1, true);
+          await PortfolioVersion.updateOne(
+              { _id: nextBaseVersion._id },
+              { $set: { snapshot: fullContent, changes: null } }
+          );
+      }
+
       await PortfolioVersion.deleteMany({
         portfolioId: id,
         version: { $lte: thresholdVersion }
@@ -245,40 +263,63 @@ router.post('/:id/restore/:versionId', verifyToken, asyncHandler(async (req, res
     throw new ApiError(500, 'Could not reconstruct version data.');
   }
 
-  // PERSIST restored content back to source of truth (UserProfile)
+  // 1. CREATE the "revert" version record FIRST (Atomic lock via unique index)
+  let newVersionNumber;
   if (isConnected) {
-    await UserProfile.findOneAndUpdate(
-      { uid: id },
-      { $set: restoredContent },
-      { upsert: true }
-    );
-
-    // Create a "revert" version automatically
     const latest = await PortfolioVersion.findOne({ portfolioId: id }).sort({ version: -1 });
-    const newVersion = (latest?.version || 0) + 1;
-    await PortfolioVersion.create({
-      portfolioId: id,
-      version: newVersion,
-      snapshot: restoredContent,
-      createdBy: req.user.uid,
-      message: `Restored to version ${versionToRestore.version}`
-    });
+    newVersionNumber = (latest?.version || 0) + 1;
+    
+    try {
+      await PortfolioVersion.create({
+        portfolioId: id,
+        version: newVersionNumber,
+        snapshot: restoredContent,
+        createdBy: req.user.uid,
+        message: `Restored to version ${versionToRestore.version}`
+      });
+    } catch (error) {
+      if (error.code === 11000) {
+        throw new ApiError(409, 'Conflict: Another restoration or save is in progress.');
+      }
+      throw error;
+    }
   } else {
-    // In-memory update is implicit as we don't have a separate UserProfile store here,
-    // but we add a new version to simulate the revert event.
     let portfolioVersions = inMemoryStore.get(id) || [];
-    const newVersion = (portfolioVersions[portfolioVersions.length - 1]?.version || 0) + 1;
+    newVersionNumber = (portfolioVersions[portfolioVersions.length - 1]?.version || 0) + 1;
     portfolioVersions.push({
       _id: `mock-${Date.now()}`,
       portfolioId: id,
-      version: newVersion,
+      version: newVersionNumber,
       snapshot: restoredContent,
       createdBy: req.user.uid,
       createdAt: new Date()
     });
     inMemoryStore.set(id, portfolioVersions);
   }
-  
+
+  // 2. APPLY the restoration to the source of truth
+  if (isConnected) {
+    const currentProfile = await UserProfile.findOne({ uid: id }).lean();
+    const portfolioFields = ['displayName', 'bio', 'jobRole', 'skills', 'location', 'website', 'github', 'linkedin', 'projects'];
+    
+    const update = { $set: {}, $unset: {} };
+    
+    // Add all fields from restored content to $set
+    for (const field of portfolioFields) {
+      if (restoredContent[field] !== undefined) {
+        update.$set[field] = restoredContent[field];
+      } else if (currentProfile && currentProfile[field] !== undefined) {
+        // If the field existed in current profile but isn't in restored content, unset it
+        update.$unset[field] = "";
+      }
+    }
+
+    if (Object.keys(update.$set).length === 0) delete update.$set;
+    if (Object.keys(update.$unset).length === 0) delete update.$unset;
+
+    await UserProfile.findOneAndUpdate({ uid: id }, update, { upsert: true });
+  }
+
   res.status(200).json({
     success: true,
     message: `Successfully restored to version ${versionToRestore.version}`,
